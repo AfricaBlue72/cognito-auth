@@ -1,0 +1,236 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for Cognito User Pool with Google federation and localized emails
+
+Parameters:
+  GoogleClientId:
+    Type: String
+    Description: Google Client ID for federation
+  GoogleClientSecret:
+    Type: String
+    Description: Google Client Secret for federation
+    NoEcho: true
+
+Resources:
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: MyUserPool
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+      AutoVerifiedAttributes:
+        - email
+      EmailConfiguration:
+        # Todo: Set to Developer when in production
+        EmailSendingAccount: COGNITO_DEFAULT
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+        - Name: username
+          AttributeDataType: String
+          Mutable: false
+          Required: true
+        - Name: locale
+          AttributeDataType: String
+          Mutable: true
+          Required: false
+      UsernameAttributes:
+        - email
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      VerificationMessageTemplate:
+        DefaultEmailOption: CONFIRM_WITH_CODE
+        EmailMessage: |
+          Welcome to our app! Your verification code is {####}.
+          Please use this code to verify your email address and complete your registration.
+          
+          If you didn't request this verification, please ignore this email.
+          
+          Thank you,
+          The App Team
+        EmailMessageByLink: |
+          Welcome to our app! Please click the link below to verify your email address:
+          {##Click here##}
+          
+          If you didn't request this verification, please ignore this email.
+          
+          Thank you,
+          The App Team
+        EmailSubject: Verify your email for our app
+      UserPoolAddOns:
+        AdvancedSecurityMode: AUDIT
+      EnabledMfas:
+        - SMS_MFA
+        - SOFTWARE_TOKEN_MFA
+      LambdaConfig:
+        CustomEmailSender: !GetAtt CustomEmailSenderFunction.Arn
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: MyUserPoolClient
+      GenerateSecret: false
+      UserPoolId: !Ref CognitoUserPool
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      SupportedIdentityProviders: 
+        - COGNITO
+        - Google
+      CallbackURLs:
+        - https://example.com/callback
+      LogoutURLs:
+        - https://example.com/logout
+      AllowedOAuthFlows:
+        - code
+        - implicit
+      AllowedOAuthScopes:
+        - phone
+        - email
+        - openid
+        - profile
+      AllowedOAuthFlowsUserPoolClient: true
+
+  GoogleIdentityProvider:
+    Type: AWS::Cognito::UserPoolIdentityProvider
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      ProviderName: Google
+      ProviderType: Google
+      ProviderDetails: 
+        client_id: !Ref GoogleClientId
+        client_secret: !Ref GoogleClientSecret
+        authorize_scopes: "profile email openid"
+      AttributeMapping:
+        email: email
+        username: sub
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub ${AWS::StackName}-${AWS::Region}-domain
+      UserPoolId: !Ref CognitoUserPool
+
+  CustomEmailSenderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const ses = new AWS.SES();
+
+          exports.handler = async (event) => {
+            const { request } = event;
+            const { userAttributes, codeParameter, linkParameter } = request;
+            const { locale } = userAttributes;
+
+            let subject, message;
+
+            switch(locale) {
+              case 'es':
+                subject = 'Verifica tu correo electrónico para nuestra aplicación';
+                message = `Bienvenido a nuestra aplicación! Tu código de verificación es ${codeParameter}.
+                           Por favor, utiliza este código para verificar tu dirección de correo electrónico y completar tu registro.
+                           
+                           Si no solicitaste esta verificación, por favor ignora este correo.
+                           
+                           Gracias,
+                           El Equipo de la Aplicación`;
+                break;
+              case 'fr':
+                subject = 'Vérifiez votre e-mail pour notre application';
+                message = `Bienvenue dans notre application ! Votre code de vérification est ${codeParameter}.
+                           Veuillez utiliser ce code pour vérifier votre adresse e-mail et compléter votre inscription.
+                           
+                           Si vous n'avez pas demandé cette vérification, veuillez ignorer cet e-mail.
+                           
+                           Merci,
+                           L'équipe de l'application`;
+                break;
+              default:
+                subject = 'Verify your email for our app';
+                message = `Welcome to our app! Your verification code is ${codeParameter}.
+                           Please use this code to verify your email address and complete your registration.
+                           
+                           If you didn't request this verification, please ignore this email.
+                           
+                           Thank you,
+                           The App Team`;
+            }
+
+            const params = {
+              Destination: { ToAddresses: [request.userAttributes.email] },
+              Message: {
+                Body: { Text: { Data: message } },
+                Subject: { Data: subject },
+              },
+              Source: 'your-ses-verified-email@example.com',
+            };
+
+            try {
+              await ses.sendEmail(params).promise();
+              return event;
+            } catch (error) {
+              console.error('Error sending email:', error);
+              throw error;
+            }
+          };
+      Runtime: nodejs14.x
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 'arn:aws:logs:*:*:*'
+
+Outputs:
+  UserPoolId:
+    Description: ID of the Cognito User Pool
+    Value: !Ref CognitoUserPool
+    Export:
+      Name: CognitoUserPoolId
+
+  UserPoolClientId:
+    Description: ID of the Cognito User Pool Client
+    Value: !Ref UserPoolClient
+    Export:
+      Name: CognitoUserPoolClientId
+
+  UserPoolDomain:
+    Description: Domain name for the Cognito User Pool
+    Value: !Sub ${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com
+    Export:
+      Name: CognitoUserPoolDomain

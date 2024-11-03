@@ -1,0 +1,1261 @@
+#!/usr/bin/env python3
+
+'''
+    cfdeploy -- Cloudformation and Lambda deployment helper
+        This script:
+            - deploys/updates/deletes Cloudformation stacks
+            - uploads/updates Lambda zips
+            - uploads/updates Lambda layer zips
+
+        For all yamls and zip files, the new version is compared to any existing version and if the same, no deployment is done.
+
+        For Cloudformation templates it is also determined if any parameters are changed. Default behaviour for 
+            Cloudformation parameters is to take existing parameter values and only override them with the ones passed
+            on the commandline. Use --no-use-current-parameters to ignore current values
+        If a Cloudformation Stack is to be updated, it generates a Change Set. If there is any Replacement or Delete in the
+            Change Set, the change is not executed unless the --force flag is provided.
+
+        When creating a Lambda Layer, you must provide the compatibility using --compatible-runtimes. If a layer already exists and
+        the compatible runtimes are not provided in the commandline, the settings of the last version are used.
+        
+
+
+    Author:
+        Marcel@lots2learn.nl/Marcel@easytocloud.com
+
+    Prerequesites:
+    - must have boto3 1.18.x installed. Use 'python3 -m pip install [--upgrade] boto3'
+
+    Todo's:
+    -- allow parameter default values to be resolved from SSM Parameter Store
+    -- verify if a region passed is valid
+    -- change Settings dict into a class
+    -- When passing a template on S3, operate from S3 instead of reading body first. This allows larger templates.
+   
+
+
+    Issues:
+    -- When using --accountids and providing the current account in there at any other than the first place, a role is not assumed
+        and therefore the credentials used are from the previous account in the list of accounts passed. This is not an issue when
+        only providing a single accountid as an argument.
+    -- Imagine adding a parameter that only influences Conditionals and in the current account that leads to no changes in resources.
+        In that case the hashes of the templates differ, but the change set turns out empty which will never apply the new template, unless
+        you add a dummy output, deploy, remove the dummy output again and deploy again. Now the latest template is used.
+        This might be fixed when we allow a stack update without change sets.
+
+    Limitations:
+    -- Even when reading from S3, the max Cloudformation template size is 50KB. This is because the template is first read into memory and 
+        the body passed to API, rather than the S3 URL. The latter would not work in case of deploying in other accounts.
+    -- Does not work properly with nested stacks as it evaluates contents and parameters of the main template only. This might be enabled
+        by using a minimum boto3 version of 1.18 and adding a flag that ignores hash values.
+
+
+    History:
+    
+    2022-04-10.28 - Fixed issue with Layer that passed CompatibleRuntimes were ignored
+    2022-04-02.27 - Now handling templates from S3 directly, rather than reading into memory. This fixes size constraint.
+    2022-04-02.26 - Changed Settings into a Class instead of Dict
+    2022-02-02.25 - Fixed error trying to validate template when deleting stack. Validation not necessary.
+    2022-01-13.24 - Added Dryrun to be more in line with AWS option naming
+    2022-01-11.23 - Validating template before deploying
+    2021-12-27.22 - Fixes issue with parameters that have comma-separated lists as values
+    2021-12-27.21 - Better formatting for errors at end of run
+    2021-12-04-20 - Force flag now does not use Change Sets to allow updates of stacks where change sets come up empty
+    2021-09-25.19 - Renamed option to --ignore-current-parameters and exiting when requiring --force but not passed
+    2021-09-17.18 - Updated error output for better troubleshooting
+    2021-08-30.17 - Added Simple error output when stack create/update/delete fails
+    2021-08-12.16 - Removed requirement for --force when using --delete for stack
+    2021-08-06.15 - Fixed bug when adding new parameter to a stack which was not recognized before
+    2021-08-06.14 - Allowing files to be deployed from S3
+    2021-08-05.13 - Added functionality to upload lambda layers, comparing hashes of zip files
+    2021-08-03.12 - Fixed bug allowing deleting stack in ROLLBACK_COMPLETE state when creating stack
+    2021-08-01.11 - Now also comparing hashes of CF templates for performance reasons
+    2021-07-31.10 - Fixed bug when creating change set which turned out empty
+    2021-07-31.09 - Fixed bug in assuming role
+    2021-07-31.08 - Fixed bug handling accountIds in argparser
+    2021-07-30.07 - Fixed bug when Change Set includes a Remove
+    2021-07-29.06 - Allowing JSON files for Cloudformation templates
+    2021-07-29.05 - Fixed bug when Stack has no parameters
+    2021-07-29.04 - Made output of parameters used readable
+    2021-07-28.03 - Fixed bug of passing parameters when creating new stack
+    2021-07-28.02 - Optimized checking parameters against current values
+    2021-07-27.01 - Initial version, based on NodeJS version by klaas@easytocloud.com
+
+'''
+
+version = '2022-04-10.28'
+
+
+import os
+# using urllib instead of requests so we don't need to do a pip install
+import urllib
+import hashlib
+import json
+import sys
+import os
+from datetime import datetime
+import argparse
+import botocore
+from boto3.session import Session
+from botocore.config import Config
+import boto3
+from typing import List
+
+
+
+Cloudformation = None       # Client for CF, instantiated later using correct region
+Lambda = None               # Instantiated later useing correct region
+STS = boto3.client('sts')   # IAM is global, so instantiate now
+S3 = boto3.client('s3')     # Instantiate in current account allows access even when deploying in other accounts
+
+_MaxInlineContentSize = 51200
+
+
+# Make a Settings Class for easier referencing than using a Dict
+class Settings:
+    def __init__(self) -> None:
+        self.Preview                     = False
+        self.Verbose                     = False
+        self.Force                       = False
+        self.Delete                      = False
+        self.IgnoreCurrentParameters     = False
+        self.Region                      = boto3.session.Session().region_name
+        self.NoWait                      = False
+        self.CreateChangeSet             = False
+        self.DeleteChangeSets            = False
+        self.BypassChangeSets            = False
+        self.Parameters                  = {}
+        self.Layer                       = None
+        self.CompatibleRuntimes          = None
+        self.OriginatingAccountId        = STS.get_caller_identity()['Account']  # pre-fill with current account
+        self.AccountIds                  = [STS.get_caller_identity()['Account']]
+        self.ExternalId                  = None
+        self.Role                        = "OrganizationAccountAccessRole"  # "AWSCloudFormationStackSetExecutionRole", "OrganizationAccountAccessRole"
+        self.Capabilities                = ["CAPABILITY_NAMED_IAM", "CAPABILITY_AUTO_EXPAND"]
+
+
+Settings = Settings()
+
+#
+#  Statuses that make us wait. Map 'STATUS' for 'waitFor' code:
+#
+CloudformationWaitStates = {
+    "REVIEW_IN_PROGRESS"  : 'stack_create_complete',
+    "CREATE_IN_PROGRESS"  : 'stack_create_complete',
+    "ROLLBACK_IN_PROGRESS": 'stack_create_complete',
+
+    "UPDATE_IN_PROGRESS"                            : 'stack_update_complete',
+    "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS"           : 'stack_update_complete',
+    "UPDATE_ROLLBACK_IN_PROGRESS"                   : 'stack_update_complete',
+    "UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS"  : 'stack_update_complete'
+}
+
+########################################
+def banner(text) -> None:
+    '''
+        banner -- print a banner
+    '''
+    print('##################################################################')
+    print(text)
+    print('##################################################################')
+
+
+########################################
+def print_version():
+    print(f'cfdeploy v{version}, using boto3 v{boto3.__version__}')
+
+
+########################################
+def splitArgs(args):
+    '''
+        splitArgs -- split arguments and return them as [ arg1=value(s), arg2=value(s) ]
+        
+        Converts 'BudgetValue=100,accountIds=123,456,ThresholdForecast=100' into [ 'BudgetValue=100' ,'accountIds=123,456', 'ThresholdForecast=100' ]
+  
+        returns list of argument strings [ arg=value, ... ]     
+    '''
+    # 'BudgetValue=100,accountIds=123,456,ThresholdForecast=100'
+    
+    # split by '='
+    separated = args.split('=')
+    result = []
+    
+    # ['BudgetValue', '100,ThresholdActual', '80,ThresholdForecast', '100,110']
+    lastArg = len(separated)-2
+    for index in range(0, lastArg+1):
+        argName = separated[index].split(',')[-1]
+        if index < lastArg:
+            value = ','.join(separated[index+1].split(',')[:-1])
+        else:
+            value = separated[index+1]
+        
+        result.append(f'{argName}={value}')
+        
+    return result
+
+
+########################################
+def parseArguments():
+    '''
+        parseArguments -- parse arguments and set Global Settings
+    '''
+    global Settings
+
+    parser = argparse.ArgumentParser(prog='cfdeploy')
+    parser.add_argument('--parameters', '--parameter', nargs=1,  help='pass parameters as Parameter=Value in comma-separated list')
+    parser.add_argument('--ignore-current-parameters', '--ignore', '-i', action='store_const', const=True, help='do not use current values of parameters')
+    parser.add_argument('--dry-run', '--dryrun', '--preview', '-p', action='store_const', const=True, help='preview only, dont execute')
+    parser.add_argument('--force', '-f', action='store_const', const=True, help='Force update even when change set leads to replacements')
+    parser.add_argument('--delete', action='store_const', const=True, help='delete the stack (not applicable to lambda zips)')
+    parser.add_argument('--create-change-set', '-c', action='store_const', const=True, help='create change set only, do not execute')
+    parser.add_argument('--delete-change-sets', action='store_const', const=True, help='delete all change sets for passed stacks')
+    parser.add_argument('--bypass-change-sets', '-b', action='store_const', const=True, help='dont use change sets but update stack directly')
+    parser.add_argument('--layer', nargs=1, help='upload layer instead of Lambda. Pass Description as argument. Layer name is taken from zip file name.')
+    parser.add_argument('--compatible-runtimes', '--layer-runtimes', nargs=1, help='layer runtimes to apply, as comma-seperated list')
+    parser.add_argument('--nowait', '--no-wait', '--no-wait-for-completion', '-n', action='store_const', const=True, help='do not wait until resources are built or deleted (to wait is default)')
+    parser.add_argument('--role', '-r', nargs=1, type=str, help='execute actions after assuming Role')
+    # parser.add_argument('--external-id', '-e', nargs=1)
+    parser.add_argument('--account-id', '--account-ids', '-a', nargs=1, help='run in AccountIds (seperated by commas)')
+    parser.add_argument('--region', '--Region', '-R', nargs=1, help='execute Clouformation in region passed')
+    parser.add_argument('--verbose', '-v', action='store_const', const=True, help='print some helpful debugging info (note: does not do much yet)')
+    parser.add_argument('--version', action='store_const', const=True, help='print version')
+
+    parser.add_argument('file', nargs='+', help='Cloudformation .Yaml/.Json or Lambda .Zip files or S3 objects')
+
+    # Now set Settings based on arguments passed
+    args = parser.parse_args()
+    if Settings.Verbose:
+        print(f'arguments passed={args}')
+
+    if args.dry_run:
+        Settings.Preview = True
+    if args.verbose:
+        Settings.Verbose = True
+    if args.force:
+        Settings.Force = True
+    if args.delete:
+        Settings.Delete = True
+    if args.nowait:
+        Settings.NoWait = True
+    if args.ignore_current_parameters:
+        Settings.IgnoreCurrentParameters = True
+    if args.create_change_set:
+        Settings.CreateChangeSet = True
+    if args.delete_change_sets:
+        Settings.DeleteChangeSets = True
+    if args.bypass_change_sets:
+        Settings.BypassChangeSets = True
+    if args.parameters:
+        parameters = splitArgs(args.parameters[0]) 
+        for parameter in parameters:
+            Settings.Parameters[parameter.split('=')[0]] = parameter.split('=')[1]
+
+    if args.layer:
+        Settings.Layer = args.layer[0]
+    if args.compatible_runtimes:
+        Settings.CompatibleRuntimes = args.compatible_runtimes[0].split(',')
+
+    if args.role:
+        Settings.Role = args.role[0]
+    if args.account_id:
+        Settings.AccountIds = args.account_id[0].split(',')
+    if args.region:
+        Settings.Region = args.region[0]
+    # if args.external_id:
+    #   Settings.ExternalId = args.external_id
+
+
+    if Settings.Verbose:
+        print(f'Files to be handled: {args.file}')
+ 
+    return args.file
+
+
+########################################
+def prettyJSON(object) -> str:
+    return json.dumps(object, indent=2, sort_keys=True)
+
+
+########################################
+def hash256(url = None, content = None, path = None) -> str:
+    '''
+        hash256 -- return SHA256 hash of provided content
+        Arguments:
+            url -- URL to determine hash for
+            content -- content to determine hash for
+            path -- file to determine hash for (cannot be S3 object)
+            Only one of the arguments should be used
+        Returns:
+            sha256 HASH as string
+    '''
+    # Only allow one argument to be passed
+    arguments = [ True for arg in [url, content, path] if arg != None]
+    assert len(arguments) == 1
+
+
+    try:
+        hash = hashlib.sha256()
+
+        if url != None:
+            with urllib.request.urlopen(url) as file:
+                hash.update(file.read())
+
+        if path != None:
+            with open(path, 'rb') as file:
+                hash.update(file.read())
+
+        if content != None:
+            hash.update(content)
+
+        return hash.hexdigest()
+
+    except Exception as error:
+        raise Exception
+
+
+########################################
+def presign(s3Path):
+    '''
+        presign - generate presigned URL for S3 path
+    '''
+    
+    params = {
+        'Bucket' : s3Path.split('s3://')[1].split('/')[0],
+        'Key' : '/'.join(s3Path.split('s3://')[1].split('/')[1:])
+    }
+    
+    try:
+        response = S3.generate_presigned_url('get_object', Params=params, ExpiresIn=10)
+        # print(response)
+        return response
+    except Exception as error:
+        print(f'{str(error)}')
+        
+
+########################################
+def readFile(path, binary = False):
+    '''
+        readFile -- read a file and return its content
+        Arguments:
+            path -- can be local file or object on S3
+            binary -- flag whether to return content as bytes (binary == True) or string
+
+        Returns:
+            the contents of the file as bytes or as string
+    '''
+
+    mode = 'r'
+    if binary:
+        mode = 'rb'
+
+    contents = None
+    try:
+        if path.startswith('s3://'):
+            # get contents from S3
+            bucket = path.split('s3://')[1].split('/')[0]
+            key = path.split('s3://' + bucket + '/')[1]
+            
+            s3Object = S3.get_object(Bucket=bucket, Key=key)
+            contents = s3Object['Body'].read()
+
+            # S3 returns bytes by default
+            if binary == False:
+                contents = contents.decode('utf-8')
+            
+        else:
+            with open(path, mode) as file:
+                contents = file.read()
+                file.close()
+
+        return contents
+    except Exception as error:
+        print(f'{str(error)}')
+        raise Exception
+
+
+########################################
+def readAndHashFile(path, binary = False):
+    '''
+        readAndHashFile -- determine SHA256 HASH of new  file
+        Arguments:
+            path -- the path to the file
+        returns:
+            fileContents -- contents of thh file
+            hash -- hexdigest of the bytes
+    '''
+
+    try:
+        contents = readFile(path = path, binary = binary)
+        if type(contents) == str:
+            hash = hash256(content=contents.encode('utf-8'))
+        else:
+            hash = hash256(content=contents)
+        return (contents, hash)
+
+    except Exception as error:
+        print(f'{str(error)}')
+        raise Exception
+
+
+########################################
+def createClients(region, credentials=None):
+    '''
+        createClients -- create boto3 Cloudformation and Lambda Client
+        Arguments:
+            region - region to get Clients for
+            credentials - credentials to use (so we can allow assuming a role in other account)
+    '''
+    if Settings.Verbose:
+        print(f'createClients: creating clients for region {region}')
+
+    try:
+        session = boto3
+        if credentials != None:
+            session = Session(aws_access_key_id=credentials['AccessKeyId'],
+                              aws_secret_access_key=credentials['SecretAccessKey'],
+                              aws_session_token=credentials['SessionToken'])
+
+        cf_config = Config(
+            region_name=region,
+            retries={
+                'max_attempts': 1024,
+                'mode': 'standard'         # requires boto3 1.17.X
+            }
+        )
+
+        lambda_config = Config(region_name=region)
+
+        cf = session.client('cloudformation', config=cf_config)
+        la = session.client('lambda', config=lambda_config)
+
+        return (cf, la)
+
+    except Exception as error:
+        print(f'{str(error)}')
+        raise Exception
+
+
+########################################
+def waitFor(StackName, operation, delay=5, ChangeSetName=None) -> None:
+    '''
+        waitFor -- wait for Cloudformation to complete an operation
+        arguments:
+            StackName -- the Stack Name to wait for
+            operation -- Cloudformation wait name, e.g. 'stack_create_complete', 'stack_update_complete', etc
+            delay -- optional: how long to wait for before checking again. Default is 15 seconds
+            ChangeSetName -- optional: name of the change set to wait for completion for
+
+    '''
+    fid = f'{StackName}: waitFor'
+
+    try:
+        waiter = Cloudformation.get_waiter(operation)
+        if ChangeSetName == None:
+            waiter.wait(StackName=StackName, WaiterConfig={'Delay': delay})
+        else:
+            waiter.wait(StackName=StackName, WaiterConfig={'Delay': delay}, ChangeSetName=ChangeSetName)
+
+    except botocore.exceptions.WaiterError as error:
+        print(f'{fid}: "{str(error)}", will evaluate error upstream')
+        raise Exception
+
+
+########################################
+def assumeRole(TargetAccountId, TargetRoleName) -> None:
+    """
+        assumeRole --
+    """
+    global Cloudformation
+    global Lambda
+
+    targetRole = 'arn:aws:iam::' + TargetAccountId + ':role/' + TargetRoleName
+
+    print(f'Calling STS.assume_role for {targetRole}')
+
+    try:
+        credentials = STS.assume_role(RoleArn=targetRole, RoleSessionName='cfdeploy')['Credentials']
+
+        (Cloudformation, Lambda) = createClients(region=Settings.Region, credentials=credentials)
+
+    except Exception as error:
+        print(f'{str(error)}')
+        raise Exception
+
+
+########################################
+def showStackErrors(StackName, exit=True):
+    '''
+        showStackErrors -- get errors when deploying stack
+        Arguments:
+            StackName
+        Result:
+            List of errors as [ error ]
+    '''
+    fid = f'{StackName}: getStackErrors'
+    
+    try:
+        stackEvents = Cloudformation.describe_stack_events(StackName = StackName)
+        
+        errors = [ event for event in stackEvents.get('StackEvents') if event.get('ResourceStatusReason') not in [ None, 'User Initiated'] ]
+        
+        print('\nStack Errors:')
+        longestResourceLength = len(max([e['LogicalResourceId'] for e in errors], key=len))
+        for error in errors:
+            print(f"- {error['LogicalResourceId']:<{longestResourceLength}} - {error['ResourceStatus']} - {error['ResourceStatusReason']}")
+        
+        
+        if len(errors) > 0 and exit:
+            os._exit(1)
+        else:
+            return errors
+        
+    except Exception as error:
+        print(f'{fid}: {str(error)}')
+        raise Exception    
+
+########################################
+def validateTemplate(StackName, Template: str) -> bool:
+    '''
+        validateTemplate -- validates if a template is ok
+        Arguments:
+            Template - can either be the template body or point to S3 key.
+    '''
+    fid = f'{StackName}: validateTemplate'
+
+    try:
+        if Template.startswith('s3://'):
+            response = Cloudformation.validate_template(TemplateURL=presign(Template))
+        else:
+            response = Cloudformation.validate_template(TemplateBody=Template)
+            
+        if response == None:
+            return True
+            
+        
+    except Exception as error:
+        print(f'{fid}: {str(error)}')
+        os._exit(1)
+        
+########################################
+def composeUpdateParameters(StackName) -> List:
+    '''
+        composeUpdateParameters -- create parameters for a CF update, preserving existing values
+        Arguments:
+            StackName -- the stack to update
+
+
+        Parameters=[
+        {
+            'ParameterKey': 'string',
+            'ParameterValue': 'string',
+            'UsePreviousValue': True|False,
+            'ResolvedValue': 'string'
+        },
+    ],
+    '''
+    try:
+        fid = f'{StackName}: composeUpdateParameters'
+        # banner(id)
+
+        stacks = Cloudformation.describe_stacks(StackName=StackName)
+        currentParametersDict = stacks['Stacks'][0].get('Parameters')
+        if currentParametersDict == None:
+            currentParametersDict = {}
+
+        # Turn into as simple key-value Dict to simplify checking values
+        currentParameters = {}
+        for parameter in currentParametersDict:
+            parameterKey = parameter['ParameterKey']
+            parameterValue = parameter['ParameterValue']
+            currentParameters[parameterKey] = parameterValue
+
+        print(f'{fid}: Current Parameters= {prettyJSON(currentParametersDict)}')
+        currentParameterNames = list(currentParameters.keys())
+
+        # Check all parameters passed on commandline are valid
+        for parameterName in Settings.Parameters.keys():
+            if parameterName not in currentParameterNames:
+                print(f"{fid}: Warning: parameter name '{parameterName}' not in current list, but will continue")
+                # Allow introduction of new parameter by adding it to the list
+                currentParameterNames.append(parameterName)
+
+                # sys.exit(1)  # don't raise exception, just stop executing
+
+        parameterList = []
+        anyParameterChanged = False
+        for parameterName in currentParameterNames:
+            # if overridden and different value, add new value
+            if parameterName in Settings.Parameters and Settings.Parameters[parameterName] != currentParameters.get(parameterName):
+                anyParameterChanged = True
+                parameterList.append({'ParameterKey': parameterName, 'ParameterValue': Settings.Parameters[parameterName]})
+                print(f"{fid}: Parameter {parameterName} changed value from {currentParameters.get(parameterName)} to {Settings.Parameters[parameterName]}")
+            # if overridden, but using same value, just keep it
+            elif parameterName in Settings.Parameters and Settings.Parameters[parameterName] == currentParameters.get(parameterName):
+                parameterList.append({'ParameterKey': parameterName, 'UsePreviousValue': True})
+            else:   # parameter not overridden
+                if not Settings.IgnoreCurrentParameters:
+                    parameterList.append({'ParameterKey': parameterName, 'UsePreviousValue': True})
+
+        print(f'{fid}: New Parameters=     {prettyJSON(parameterList)}')
+
+        return (parameterList, anyParameterChanged)
+
+    except Exception as error:
+        print(f'{fid}: {str(error)}')
+        raise Exception
+
+
+########################################
+def createStack(StackName, Template) -> None:
+    '''
+        createStack -- create a Cloudformation stack
+        arguments:
+            StackName -- name of the stack
+            Template  -- either body or path to S3
+    '''
+    fid = f'{StackName}: createStack'
+    banner(f'{StackName}: Creating Stack')
+    
+    isS3Template = Template.startswith('s3://')
+
+    try:
+        # Set Parameters in CF accepted format
+
+        parameters = []
+        for parameter in Settings.Parameters:
+            parameters.append({'ParameterKey': parameter, 'ParameterValue': Settings.Parameters[parameter]})
+
+        print(f"{fid}: Calling Cloudformation.create_stack with Parameters={parameters} and Capabilities={Settings.Capabilities}")
+
+        if Settings.Preview:
+            print(f'{fid}: just previewing, will not actually create the stack')
+            return
+
+    
+        if Settings.Parameters == {}:
+            if isS3Template:
+                Cloudformation.create_stack(StackName=StackName, TemplateURL=presign(Template), Capabilities=Settings.Capabilities)
+            else:
+                Cloudformation.create_stack(StackName=StackName, TemplateBody=Template, Capabilities=Settings.Capabilities)
+        else:
+            if isS3Template:
+                Cloudformation.create_stack(StackName=StackName, TemplateURL=presign(Template), Capabilities=Settings.Capabilities, Parameters=parameters)
+            else:
+                Cloudformation.create_stack(StackName=StackName, TemplateBody=Template, Capabilities=Settings.Capabilities, Parameters=parameters)
+
+        if Settings.NoWait:
+            print(f'{fid}: Not waiting for stack creation to complete')
+            return
+
+        waitFor(StackName=StackName, operation='stack_create_complete')
+        print(f'{fid}: Cloudformation.wait for create_stack_complete returning OK')
+
+        return
+
+    except Exception as error:
+        # print(f'{fid}: {str(error)}')
+        showStackErrors(StackName)
+        raise Exception
+
+
+########################################
+def safeToDeployChangeSet(StackName, ChangeSetName) -> bool:
+    '''
+        safeToDeployChangeSet -- return False if change set contains any Delete or Replacement
+        Returns True if there is no resource requiring replacement
+    '''
+
+    fid = f'{StackName}: safeToDeployChangeSet'
+    banner(f'{StackName}: Checking if it is safe to deploy change set')
+
+    try:
+        changeSet = Cloudformation.describe_change_set(StackName=StackName, ChangeSetName=ChangeSetName)
+        changes = [change['ResourceChange'] for change in changeSet['Changes']]
+
+        changeSummary = [
+            {
+                'Action': change['Action'],
+                'LogicalResourceId': change['LogicalResourceId'],
+                'ResourceType': change['ResourceType'],
+                'Replacement': change.get('Replacement')
+            }
+            for change in changes
+        ]
+
+        noReplacement = 'True' not in [change['Replacement'] for change in changeSummary]
+        noRemove = 'Remove' not in [change['Action'] for change in changeSummary]
+
+        noReplacementOrRemove = noReplacement and noRemove
+
+        print(f'{fid}: Summary of changes: {prettyJSON(changeSummary)}')
+        print(f'{fid}: Executing changes will lead to replacements or removal: {not noReplacementOrRemove}')
+
+        return noReplacementOrRemove
+
+    except Exception as error:
+        print(f'{fid}: {str(error)}')
+        raise Exception
+
+
+########################################
+def createChangeSet(StackName, Template) -> str:
+    '''
+        createChangeSet -- Create Change set instead of updating stack
+        Arguments:
+            StackName -- name of the stack
+            TemplateBody -- body of the Cloudformation template to update
+        Returns:
+            The name of the change set
+    '''
+    fid = f'{StackName}: createChangeSet'
+    banner(f'{StackName}: Creating Change Set')
+
+    isS3Template = Template.startswith('s3://')
+    
+    try:
+        # Make sure to apply parameters already currently in use and only override the ones passed on commandline
+        (parameters, anyParameterChanged) = composeUpdateParameters(StackName=StackName)
+
+        # Check if template file has changed compared to current one deployed
+        currentTemplateBody = Cloudformation.get_template(StackName=StackName, TemplateStage='Original')['TemplateBody']
+        currentTemplateHash = hash256(content=currentTemplateBody.encode())
+        
+        if isS3Template:
+            templateHash = hash256(content=readFile(Template).encode())
+        else:
+            templateHash = hash256(content=Template.encode())
+
+        print(f'{fid}: New template hash     : {templateHash}')      
+        print(f'{fid}: Existing template hash: {currentTemplateHash}')
+
+
+        if currentTemplateHash == templateHash and not anyParameterChanged:
+            print(f'{fid}: Hashes are identical and no parameters changed, no update required')
+            return None
+
+    except Exception:
+        raise Exception
+
+
+    changeSetName = f'{StackName}-{datetime.now()}'.replace(' ', '-').replace(':', '').split('.')[0]
+    print(f'{fid}: changeSetName: {changeSetName}')
+
+    changeSetError = None
+
+    try:
+        print(f"{fid}: Calling Cloudformation.create_change_set with Parameters={parameters} and Capabilities={Settings.Capabilities}")
+
+        if isS3Template:
+            Cloudformation.create_change_set(
+                StackName=StackName,
+                TemplateURL=presign(Template),
+                Parameters=parameters,
+                Capabilities=Settings.Capabilities,
+                ChangeSetName=changeSetName,
+                ChangeSetType='UPDATE',
+                # IncludeNestedStacks = True        # only available in later boto3 versions
+            )
+        else:
+            Cloudformation.create_change_set(
+                StackName=StackName,
+                TemplateBody=Template,
+                Parameters=parameters,
+                Capabilities=Settings.Capabilities,
+                ChangeSetName=changeSetName,
+                ChangeSetType='UPDATE',
+                # IncludeNestedStacks = True        # only available in later boto3 versions
+            )
+
+        # Always wait for a change set to be completed, otherwise execute will fail furtheron
+        waitFor(StackName=StackName, operation='change_set_create_complete', ChangeSetName=changeSetName)
+        print(f'{fid}: Cloudformation.create_change_set completed OK')
+
+        return changeSetName
+
+    except Exception as error:
+        # print(f'{fid}: ERROR {str(error)}')
+        changeSetError = error
+
+    # if no change, then delete change set and return None as ChangeSetName
+    changeSets = Cloudformation.list_change_sets(StackName=StackName)
+    changeSet = [change for change in changeSets['Summaries'] if change['ChangeSetName'] == changeSetName][0]   # There's only one
+    if changeSetError and changeSet['Status'] == 'FAILED' and ("didn't contain changes" in changeSet['StatusReason'] or "No updates are to be performed" in changeSet['StatusReason']):
+        print(f'{fid}: No changes to stack, deleting Change Set again')
+        Cloudformation.delete_change_set(StackName=StackName, ChangeSetName=changeSetName)
+        return None
+    elif changeSetError:
+        # Raise other error
+        print(f'{fid}: raising error {str(changeSetError)}')
+        raise Exception(changeSetError)
+
+
+########################################
+def executeChangeSet(StackName, ChangeSetName) -> None:
+    '''
+        executeChangeSet -- execute a change set
+        Arguments:
+            StackName -- name of the stack
+            ChangeSetName -- name of the change set to execute
+    '''
+    fid = f'{StackName}: executeChangeSet'
+    banner(f'{StackName}: Executing Change Set')
+
+    if Settings.Preview:
+        print(f'{fid}: just previewing, will not actually update the stack')
+        return
+
+    try:
+        print(f'{fid}: Calling Cloudformation.execute_change_set for change {ChangeSetName}')
+        Cloudformation.execute_change_set(StackName=StackName, ChangeSetName=ChangeSetName)
+
+        if Settings.NoWait:
+            print(f'{fid}: Not waiting for execute change set to complete')
+            return
+
+        waitFor(StackName=StackName, operation='stack_update_complete')
+        print(f'{fid}: Cloudformation.execute_change_set returning OK')
+
+        return
+
+    except Exception as error:
+        # print(f'{fid}: {str(error)}')
+        showStackErrors(StackName)
+        raise Exception
+
+
+########################################
+def updateStack(StackName, Template) -> None:
+    '''
+        updateStack -- Update a stack without creating change set
+        Arguments:
+            StackName -- name of the stack
+            TemplateBody -- body of the Cloudformation template to update
+        Returns:
+            Nothing
+    '''
+    fid = f'{StackName}: updateStack'
+    banner(f'{StackName}: Update Stack')
+    
+    isS3Template = Template.startswith('s3://')
+
+    try:
+        # Make sure to apply parameters already currently in use and only override the ones passed on commandline
+        (parameters, anyParameterChanged) = composeUpdateParameters(StackName=StackName)
+
+        # Check if template file has changed compared to current one deployed
+        currentTemplateBody = Cloudformation.get_template(StackName=StackName, TemplateStage='Original')['TemplateBody']
+        currentTemplateHash = hash256(content=currentTemplateBody.encode())
+        
+        if isS3Template:
+            templateHash = hash256(content=readFile(Template).encode())
+        else:
+            templateHash = hash256(content=Template.encode())
+
+        print(f'{fid}: New template hash     : {templateHash}')      
+        print(f'{fid}: Existing template hash: {currentTemplateHash}')
+
+
+        if currentTemplateHash == templateHash and not anyParameterChanged:
+            print(f'{fid}: Hashes are identical and no parameters changed, no update required')
+            return None
+
+    except Exception:
+        raise Exception
+
+
+    try:
+        print(f"{fid}: Calling Cloudformation.update_stack with Parameters={parameters} and Capabilities={Settings.Capabilities}")
+
+        if Settings.Preview:
+            print(f'{fid}: just previewing, will not actually update the Stack')
+            return
+            
+        if isS3Template:
+            # Do the stack update
+            Cloudformation.update_stack(
+                StackName=StackName,
+                TemplateURL=presign(Template),
+                Parameters=parameters,
+                Capabilities=Settings.Capabilities,
+            )
+        else:
+            # Do the stack update
+            Cloudformation.update_stack(
+                StackName=StackName,
+                TemplateBody=Template,
+                Parameters=parameters,
+                Capabilities=Settings.Capabilities,
+            )
+
+        if Settings.NoWait:
+            print(f'{fid}: Not waiting for stack update to complete')
+            return
+        
+        
+        waitFor(StackName=StackName, operation='stack_update_complete')
+        print(f'{fid}: Cloudformation.update_stack completed OK')
+
+        return
+
+    except Exception as error:
+        # print(f'{fid}: ERROR {str(error)}')
+        showStackErrors(StackName)
+        raise Exception
+        
+
+   
+
+########################################
+def deleteChangeSets(StackName) -> None:
+    '''
+        deleteChangeSets -- delete all change sets of a Stack
+        Arguments:
+            StackName -- name of the stack
+    '''
+    fid = f'{StackName}: deleteChangeSets'
+    banner(f'{StackName}: Deleting all Change Sets')
+
+    try:
+        changeSets = Cloudformation.list_change_sets(StackName=StackName)
+        changeSetNames = [changeSet['ChangeSetName']  for changeSet in changeSets['Summaries']]
+        print(f'{fid}: Change sets about to be deleted: {changeSetNames}')
+
+        if Settings.Preview:
+            print(f'{fid}: just previewing, will not actually delete the changeSets')
+            return
+
+        for changeSetName in changeSetNames:
+            print(f'{fid}: Calling Cloudformation.delete_change_set for {changeSetName}')
+            Cloudformation.delete_change_set(StackName=StackName, ChangeSetName=changeSetName)
+
+        print(f'{fid}: All change sets deleted')
+
+        return
+
+    except Exception as error:
+        print(f'{fid}: {str(error)}')
+        raise Exception
+
+
+########################################
+def deleteStack(StackName, Force=False) -> None:
+    '''
+        deleteStack -- delete a Cloudformation stack
+        arguments:
+            StackName -- name of the stack to delete
+            Force -- Boolean to allow internal use to automatically delete a stack after unsuccessful first deploy
+    '''
+    fid = f'{StackName}: deleteStack'
+
+    banner(f'{StackName}: Deleting Stack')
+
+    if Settings.Preview:
+        print(f'{fid}: just previewing, will not actually delete the stack')
+        return
+
+    if not Force and not Settings.Force:
+        print(f'{fid}: Deleting stack requires use of --force as well for safety. Not executing now')
+        return
+
+    try:
+        print(f"{fid}: Calling Cloudformation.delete_stack for {StackName}")
+
+        Cloudformation.delete_stack(StackName=StackName)
+
+        if Settings.NoWait:
+            print(f'{fid}: Not waiting for stack delete to complete')
+            return
+
+        waitFor(StackName=StackName, operation='stack_delete_complete')
+        print(f'{fid}: Cloudformation.wait for stack_delete_complete returning OK')
+
+        return
+
+    except Exception as error:
+        # print(f'{fid}: {str(error)}')
+        showStackErrors(StackName)
+        raise Exception
+
+
+########################################
+def processStack(path):
+    '''
+        processStack -- Process a CloudFormation Stack request
+        Argument:
+            path -- the local file path to the stack (cannot represent S3 object yet)
+    '''
+    fid = f'{path}: processStack'
+
+    banner(f'{path}: Processing Stack')
+    
+    isS3Template = path.startswith('s3://')
+
+    newTemplate = None
+
+    try:
+        # Don't read template if we just want to delete stack or change sets
+        if not (Settings.Delete or Settings.DeleteChangeSets):
+            newTemplate = readFile(path = path, binary = False)
+            print(f'{fid}: content has length {len(newTemplate)}')
+            
+            if len(newTemplate) > _MaxInlineContentSize and isS3Template:
+                print(f'{fid}: Template content too long to use as inline body, will read from S3 instead')
+                newTemplate = path
+                
+    except Exception as error:
+        print(f'{fid}: {str(error)}')
+        raise Exception
+
+    # './StackName.yaml' becomes 'StackName'
+    stackName = path.split('/').pop().split('.')[0]
+
+    # Get current stack status
+    currentStatus = None
+    stackExists = False
+    stacks = {}
+
+    try:
+        stacks = Cloudformation.describe_stacks(StackName=stackName)
+        stackExists = True
+    except Exception as error:
+        stackExists = False
+
+    try:
+        # If we want to delete but stack does not exist, just leave and continue with next to be idempotent
+        if stackExists == False and Settings.Delete:
+            print(f'{fid}: stack is not found so nothing to delete')
+            return
+
+        # No template validation when deleting
+        if not Settings.Delete:
+            # Validate template first before deploying. Will exit if not valid
+            validateTemplate(StackName=stackName, Template=newTemplate)
+
+        
+        # Create stack if it does not exist yet
+        if stackExists == False:
+            createStack(StackName=stackName, Template=newTemplate)
+            return
+
+        # Delete stack if requested
+        if Settings.Delete:
+            deleteStack(StackName=stackName, Force=True)
+            return
+
+        # Delelete all change Sets
+        if Settings.DeleteChangeSets:
+            deleteChangeSets(StackName=stackName)
+            return
+
+        # Not a Create or a Delete, so an Update. Current state determines what to do
+
+        # Wait for any operation that still needs to finish
+        currentStatus = stacks['Stacks'][0]['StackStatus']
+        if CloudformationWaitStates.get(currentStatus) == None:
+            print(f'{fid}: status {currentStatus} will not make us wait; continuing')
+        else:
+            waitOperation = CloudformationWaitStates.get(currentStatus)
+            print(f'{fid}: status {currentStatus} forces us to wait for {waitOperation}')
+            waitFor(StackName=stackName, operation=waitOperation)
+
+        if currentStatus != 'ROLLBACK_COMPLETE':
+            print(f'{fid}: will continue with the stack since we assume the status {currentStatus} allows it')
+        else:
+            print(f'{fid}: About to invoke deleteStack since the stack is in ROLLBACK_COMPLETE state')
+            deleteStack(StackName=stackName, Force=True)
+
+            # Now create stack again
+            createStack(StackName=stackName, Template=newTemplate)
+            return
+
+        if Settings.BypassChangeSets:
+            updateStack(StackName=stackName, Template=newTemplate)
+            return
+  
+        # Last option is to update the stack using Change Sets
+        changeSetName = createChangeSet(StackName=stackName, Template=newTemplate)
+
+        if Settings.CreateChangeSet and changeSetName != None:
+            # This just outputs a summary of the changes
+            safeToDeployChangeSet(StackName=stackName, ChangeSetName=changeSetName)
+
+        if not Settings.CreateChangeSet and changeSetName != None:
+            if safeToDeployChangeSet(StackName=stackName, ChangeSetName=changeSetName) or Settings.Force:
+                executeChangeSet(StackName=stackName, ChangeSetName=changeSetName)
+            else:
+                print(f'{fid}: There are replacements or deletes and --force flag not used, not executing changes')
+                # Exit with error so any make(1) does not continue
+                os._exit(1)
+
+    except Exception as error:
+        # print(f'{fid}: {str(error)}')
+        raise Exception(str(error))
+
+
+########################################
+def updateLambdaCode(path) -> None:
+    '''
+        updateLambdaCode -- update the lambda ZIP, but only if hash differs from current
+    '''
+
+    fid = f'{path}: updateLambdaCode'
+    banner(f'{path}: Updating Lambda Code')
+
+    try:
+        # './StackName.zip' becomes 'StackName'
+        functionName = path.split('/').pop().split('.')[0]
+        print(f'{fid}: Function name {functionName}')
+
+        (zipFileContent, zipFileHash) = readAndHashFile(path=path, binary=True)
+        print(f'{fid}: Zip file hash is: {zipFileHash}')
+
+        functionDetails = Lambda.get_function(FunctionName=functionName)
+        location = functionDetails['Code']['Location']
+
+        # Retrieving stored CodeSha256 from lambda will be different than computing ourselves
+        functionHash = hash256(url=location)
+
+        print(f'{fid}: Existing hash is: {functionHash}')
+
+        if zipFileHash == functionHash:
+            print(f'{fid}: Hashes are identical, no update required')
+            return
+
+        if Settings.Preview:
+            print(f'{fid}: just previewing, will not actually update the lambda function')
+            return
+
+        print(f'{fid}: Calling Lambda.update_function_code to upload zip file for {functionName}')
+        Lambda.update_function_code(
+            FunctionName=functionName, ZipFile=zipFileContent)
+        print(f'{fid}: function code updated ok')
+
+    except Exception as error:
+        print(f'{fid}: {str(error)}')
+        os._exit(1)
+
+
+########################################
+def createOrUpdateLayer(path) -> None:
+    '''
+        createOrUpdateLayer -- update the layer ZIP, but only if hash differs from current
+    '''
+
+    fid = f'{path}: createOrUpdateLayer'
+    banner(f'{path}: Creating or Updating Lambda Layer')
+
+    try:
+        # './layerName.zip' becomes 'layerName'
+        layerName = path.split('/').pop().split('.')[0]
+        print(f'{fid}: Layer Name       : {layerName}')
+        print(f"{fid}: Layer Description: {Settings.Layer}")
+
+        (zipFileContent, zipFileHash) = readAndHashFile(path=path, binary=True)
+        print(f'{fid}: Zip file hash is : {zipFileHash}')
+
+
+        existingLayerHash = None
+        runtimes = Settings.CompatibleRuntimes
+
+        layers = Lambda.list_layers()
+        if layers != []:
+            # We have existing layers
+            layers = [layer for layer in layers['Layers'] if layer['LayerName'] == layerName ]
+            if layers != []:
+                # We have an existing layer with correct name
+                layer = layers[0]
+
+                latestVersion = layer['LatestMatchingVersion']
+
+                # just use current runtimes if not provided in commandline
+                if Settings.CompatibleRuntimes == None:
+                    runtimes = latestVersion['CompatibleRuntimes']
+
+                # Get URL of layer and determine its hash
+                layerDetails = Lambda.get_layer_version(LayerName=layerName, VersionNumber=latestVersion['Version'])
+                layerLocation = layerDetails['Content']['Location']
+
+                # now get the hash for existing layer
+                existingLayerHash = hash256(url=layerLocation)
+        
+        print(f'{fid}: Existing hash is : {existingLayerHash}')
+
+        if zipFileHash == existingLayerHash:
+            print(f'{fid}: Hashes are identical, no update required')
+            return
+
+        if Settings.Preview:
+            print(f'{fid}: just previewing, will not actually update the layer')
+            return
+
+        if existingLayerHash == None and runtimes == None:
+            print(f'{fid}: Layer does not exist yet, you must use --compatible-runtimes to set the runtimes for this layer')
+            sys.exit(1)
+
+        print(f'{fid}: Calling Lambda.publish_layer_version to upload zip file for {layerName}')
+        response = Lambda.publish_layer_version(
+            LayerName=layerName, 
+            Description=Settings.Layer, 
+            Content = { "ZipFile" : zipFileContent },
+            CompatibleRuntimes = runtimes)
+
+        print(f"{fid}: Layer code updated ok to version {response['Version']}")
+
+    except Exception as error:
+        print(f'{fid}: {str(error)}')
+        sys.exit(1)
+
+
+########################################
+def deployPath(path):
+    '''
+        deployPath -- determine correct action based on path-file extension for YAML or ZIP
+        argument:
+            path -- file pathname of file to process
+    '''
+
+    fid = f'{path}: deployPath'
+    extension = path.split('.').pop().lower()
+    try:
+        if extension in ['yaml', 'yml', 'json']:
+            processStack(path)
+            return
+        if extension in ['zip'] and Settings.Layer == None:
+            updateLambdaCode(path)
+            return
+        if extension in ['zip'] and Settings.Layer != None:
+            createOrUpdateLayer(path)
+            return
+        print(f'{fid}: does not represent YAML or ZIP, ignoring file')
+        return
+    except Exception as error:
+        # print(f'{fid}: {str(error)}')
+        raise Exception
+
+
+########################################
+def main():
+    global Cloudformation
+    global Lambda
+
+    files = parseArguments()
+    (Cloudformation, Lambda) = createClients(region=Settings.Region)
+
+    try:
+        # make all changes per account first so yaml and zips for lambdas are updated quickly per account
+        for accountId in Settings.AccountIds:
+            # Note there's a bug here when the OriginatingAccountId is in the list of accounts to use
+            # if it's not the first one then the Role still points to the previous account
+            if accountId != Settings.OriginatingAccountId:
+                assumeRole(TargetAccountId=accountId, TargetRoleName=Settings.Role)
+            for file in files:
+                deployPath(file)
+                print('\n')
+    except Exception as error:
+        print(f'{str(error)}')
+        raise Exception
+
+
+if __name__ == '__main__':
+    print_version()
+    main()

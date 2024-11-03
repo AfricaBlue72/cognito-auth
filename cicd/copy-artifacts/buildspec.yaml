@@ -1,0 +1,32 @@
+# used by: CodeBuild
+version: 0.2
+
+env:
+  variables:
+    WHATEVER: "whatever"
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 12
+      python: 3.8
+    commands:
+      - echo Modifying all shell scripts to mode 755...
+      - find . -name "*.sh" -exec chmod 755 '{}' ';'
+      - echo Modifying all cicd nodejs scripts to mode 755...
+      - find cicd -name "*.js" -exec chmod 755 '{}' ';'
+      - echo Adding cicd/scripts to PATH...
+      - export PATH=$(pwd)/cicd/scripts:$PATH
+      - echo yum install -y banner
+
+  build:
+    commands:
+      - echo Changing role...
+      - . ./cicd/scripts/changerole.sh
+      - echo Copying artifacts...
+      - ./cicd/scripts/copyProductionArtifacts.sh
+
+artifacts:
+  files:
+    - cicd/**/*
+  discard-paths: no

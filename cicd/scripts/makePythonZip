@@ -1,0 +1,80 @@
+#!/bin/bash
+#
+# MakePythonZip - Make a zipfile from a virtual environment, optionally starting with a base AWS virtual environment Zipfile (in case we use Pandas or Numpy)
+#   For testing the local environment will hold pandas and numpy as well. Skip these while merging the zips
+#   
+
+
+LIBDIR=$(ls -d venv/lib/python3.*/*-packages)    # independent of Python3 version and whether we have site-packages or dist-packages
+EXCLUDE="boto3 botocore numpy pandas easy_install.py pkg_resources setup_tools"
+SOURCEZIP=""
+
+
+
+function Usage()
+{
+    echo "Usage: $(basename $0) [-i SourceZip] [-l PythonLibraryDir] [-h] ZipFile" >&2
+    echo "   -i SourceZip        -- includes SourceZip" >&2
+    echo "   -l PythonLibraryDir -- find Python modules in this directory (using ${LIBDIR} as default)" >&2
+    echo "   -h                  -- show Usage" >&2
+
+    exit 2  
+}
+
+
+while getopts i:l: opt $@
+do
+    case $opt in
+    i)
+        SOURCEZIP=${OPTARG}
+        ;;
+    l)
+        LIBDIR=${OPTARG}
+        ;;
+    \?)
+        Usage
+        ;;
+    esac
+done
+
+shift $((OPTIND -1))
+
+
+
+# Set Destination Zip
+if [[ "$#" != 1 ]]
+then
+    Usage
+else
+    ZIP=$1
+fi
+
+# Check of directory with Python packages exists
+if [[ ! -d ${LIBDIR} ]]
+then
+    echo "Error: Python directory '${LIBDIR}' does not exist"
+    exit 1
+fi
+
+# check if Source Zip exists
+if [[ ! -z ${SOURCEZIP} ]] && [[ ! -f ${SOURCEZIP} ]]
+then
+    echo "Error: Source zipfile '${SOURCEZIP}' does not exist"
+    exit 1
+fi
+
+
+
+
+# If we use the Source Zip, copy to destination zip
+[[ -f  ${SOURCEZIP} ]] && echo "Copying ${SOURCEZIP} to ${ZIP}" && cp ${SOURCEZIP} ${ZIP}
+
+# Determine which packages to add
+FILESTOZIP=$(cd ${LIBDIR}; ( ls | grep -v boto3 | grep -v botocore | grep -v numpy | grep -v pandas | grep -v pip | grep -v '\-info' ) )
+
+CURDIR=${PWD}
+
+echo "Adding '${LIBDIR}' packages to zip..."
+
+( cd ${LIBDIR} ; zip -qr9 ${CURDIR}/${ZIP} ${FILESTOZIP} )
+

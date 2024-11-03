@@ -1,0 +1,147 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS CloudFormation template to launch resources for a cognito identity pool
+
+Parameters:
+  ProductName: 
+    Type: String
+    
+  Environment:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: Environment
+    Description: The environment name from SSM Parameter Store
+          
+Resources:          
+## Cognito custom message table
+  CustomMessageTable:
+    Type: AWS::S3::Bucket
+    Properties: 
+      BucketName: !Sub ${ProductName}-${Environment}-custom-messages-${AWS::Region}-${AWS::AccountId}
+      BucketEncryption: 
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+ 
+## Artifact bucket       
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:  
+      BucketName: !Sub ${ProductName}-${Environment}-artifacts-${AWS::Region}-${AWS::AccountId}
+      BucketEncryption: 
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+## Bucket for gerenal objects accessible for authenticated and unauthenticated users     
+  GeneralPublicBucket:
+    Type: AWS::S3::Bucket
+    Properties: 
+      BucketName:
+      BucketName: !Sub ${ProductName}-${Environment}-general-public-${AWS::Region}-${AWS::AccountId}
+      BucketEncryption: 
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+        
+## Bucket for gerenal objects accessible for authenticated users     
+  GeneralAuthBucket:
+    Type: AWS::S3::Bucket
+    Properties: 
+      BucketName:
+      BucketName: !Sub ${ProductName}-${Environment}-general-auth-${AWS::Region}-${AWS::AccountId}
+      BucketEncryption: 
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+        
+  PrivateAuthBucket:
+    Type: AWS::S3::Bucket
+    Properties: 
+      BucketName:
+      BucketName: !Sub ${ProductName}-${Environment}-private-auth-${AWS::Region}-${AWS::AccountId}
+      BucketEncryption: 
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+Outputs:
+    CustomMessageTableOutput:
+        Value: !Ref CustomMessageTable
+        Export:
+            Name: CustomMessageTable
+            
+    CustomMessageTableArnOutput:
+        Value: !GetAtt CustomMessageTable.Arn  
+        Export:
+            Name: CustomMessageTableArn
+            
+    ArtifactBucketNameOutput:
+        Value: !Ref ArtifactBucket
+        Export:
+            Name: ArtifactBucket
+            
+    ArtifactBucketNameArnOutput:
+        Value: !GetAtt ArtifactBucket.Arn  
+        Export:
+            Name: ArtifactBucketArn
+            
+    GeneralPublicBucketOutput:
+        Value: !Ref GeneralPublicBucket
+        Export:
+            Name: GeneralPublicBucket
+            
+    GeneralPublicBucketArnOutput:
+        Value: !GetAtt GeneralPublicBucket.Arn  
+        Export:
+            Name: GeneralPublicBucketArn
+            
+    GeneralAuthBucketOutput:
+        Value: !Ref GeneralAuthBucket
+        Export:
+            Name: GeneralAuthBucket
+            
+    GeneralAuthBucketArnOutput:
+        Value: !GetAtt GeneralAuthBucket.Arn  
+        Export:
+            Name: GeneralAuthBucketArn
+            
+    PrivateAuthBucketOutput:
+        Value: !Ref PrivateAuthBucket
+        Export:
+            Name: PrivateAuthBucket
+            
+    PrivateAuthBucketArnOutput:
+        Value: !GetAtt PrivateAuthBucket.Arn  
+        Export:
+            Name: PrivateAuthBucketArn
+

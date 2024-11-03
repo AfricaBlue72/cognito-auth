@@ -1,0 +1,193 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS CloudFormation template to launch resources for a cognito identity pool
+
+Parameters:
+  ProductName: 
+    Type: String
+    Default: cognito-auth
+
+  ClientName: 
+    Type: String
+    Default: cognito-app
+
+  UserPoolName:
+    Description: The name of the userpool
+    Type: String
+    Default: cognito-auth-user-pool
+
+  Environment:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /Environment
+
+Conditions:
+  IsProduction: !Equals 
+    - !Ref Environment
+    - production
+
+Resources:
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub ${Environment}-${ClientName}
+      GenerateSecret: false
+      UserPoolId: !ImportValue
+        Fn::Sub: ${UserPoolName}-id
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      SupportedIdentityProviders: 
+        - COGNITO
+        - Google
+      CallbackURLs: !If 
+        - IsProduction
+        - - https://cognito-app.bluecoast.co.za
+        - - !Sub https://${Environment}-cognito-app.bluecoast.co.za
+      LogoutURLs: !If 
+        - IsProduction
+        - - https://cognito-app.bluecoast.co.za
+        - - !Sub https://${Environment}-cognito-app.bluecoast.co.za
+      AllowedOAuthFlows:
+        - code
+        - implicit
+      AllowedOAuthScopes:
+        - email
+        - openid
+        - profile
+        - aws.cognito.signin.user.admin
+      AllowedOAuthFlowsUserPoolClient: true
+
+  IdentityPool:            
+    Type: AWS::Cognito::IdentityPool
+    DependsOn: 
+    - UserPoolClient
+    Properties: 
+      AllowClassicFlow: False
+      AllowUnauthenticatedIdentities: True
+      CognitoIdentityProviders: 
+      - ClientId: !Ref UserPoolClient
+        ProviderName: !ImportValue 
+          Fn::Sub: ${UserPoolName}-provider-name
+        ServerSideTokenCheck: True
+      IdentityPoolName: !Sub ${Environment}-${ClientName}-identity-pool
+
+  UnAuthenticatedRole:  
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: UnAuthenticatedRoleForCognito
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Federated: cognito-identity.amazonaws.com
+          Action:
+          - sts:AssumeRoleWithWebIdentity
+          Condition:
+            StringEquals:
+              cognito-identity.amazonaws.com:aud: !Ref IdentityPool
+            ForAnyValue:StringLike:
+              cognito-identity.amazonaws.com:amr: unauthenticated
+      Path: /
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - mobileanalytics:PutEvents
+            - cognito-sync:*
+            Resource: '*'
+                        
+  AuthenticatedRole:  
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AuthenticatedRoleForCognito
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Federated: cognito-identity.amazonaws.com
+          Action:
+          - sts:AssumeRoleWithWebIdentity
+          Condition:
+            StringEquals:
+              cognito-identity.amazonaws.com:aud: !Ref IdentityPool
+            ForAnyValue:StringLike:
+              cognito-identity.amazonaws.com:amr: authenticated
+      Path: /
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - mobileanalytics:PutEvents
+            - translate:TranslateText
+            - polly:DescribeVoices
+            - polly:SynthesizeSpeech
+            - cognito-sync:*
+            Resource: '*'
+      - PolicyName: GeneralAuthBucketReadAccess
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:GetObject
+            - s3:GetBucketLocation
+            - s3:ListBucket
+            Resource: 
+            - !ImportValue GeneralAuthBucketArn
+            - !Join ['', [!ImportValue GeneralAuthBucketArn, "/*"]]
+      - PolicyName: PrivateBucketAccess
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:GetObject
+            - s3:DeleteObject
+            - s3:PutObject
+            Resource: 
+            - !Join ['', [!ImportValue PrivateAuthBucketArn, "/users/${cognito-identity.amazonaws.com:sub}/*"]]
+          - Effect: Allow
+            Action:
+            - s3:GetBucketLocation
+            - s3:ListBucket
+            Resource: 
+            - !ImportValue PrivateAuthBucketArn
+            Condition: 
+              StringLike: 
+                's3:prefix': '/users/${cognito-identity.amazonaws.com:sub}/*'
+                        
+  GeneralPublicBucketReadAccessPolicy:
+    Type: AWS::IAM::Policy
+    Properties: 
+      PolicyName: GeneralPublicBucketReadAccess
+      PolicyDocument: 
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Action:
+          - s3:GetObject
+          - s3:GetBucketLocation
+          - s3:ListBucket
+          Resource: 
+          - !ImportValue GeneralPublicBucketArn
+          - !Join ['', [!ImportValue GeneralPublicBucketArn, "/*"]]
+      Roles: 
+        - !Ref AuthenticatedRole
+        - !Ref UnAuthenticatedRole
+            
+  IdentityPoolRoleAttachment: 
+    Type: AWS::Cognito::IdentityPoolRoleAttachment 
+    Properties: 
+      IdentityPoolId: !Ref IdentityPool
+      Roles: 
+        "authenticated": !GetAtt AuthenticatedRole.Arn 
+        "unauthenticated": !GetAtt UnAuthenticatedRole.Arn

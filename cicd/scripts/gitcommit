@@ -1,0 +1,53 @@
+#!/usr/bin/env sh
+
+# apple only: security delete-internet-password -l git-codecommit.eu-west-1.amazonaws.com > /dev/null 2>&1
+# Version 2019-06-07a
+
+while [ ! -d ".git" -a ${PWD} != "/" ]
+do
+   cd ..
+done
+
+if [ ! -d .git ]
+then 
+   echo "ERROR: cannot find .git" >&2
+   exit -1
+fi
+echo "Working from ${PWD}..."
+
+echo
+echo "Make sure you are in the branch you expect:"
+echo
+git branch -a
+echo
+
+branch=$( git branch | grep \* | cut -d ' ' -f2 )
+if [ "${branch}" == "master" ]
+then
+	echo "   ."
+	echo "  /!\\  failed successfuly!"
+	echo "  ~~~   kindly refussing to commit to master!"
+	echo
+	exit 1
+else
+    echo
+    echo "ok, commiting to ${branch}"    
+    echo
+fi
+
+name=$( git config -l | grep ^user.name | awk -F= '{ print $2 }' )
+echo "your name: ${name}"
+while [[ "${name}" = "" ]]
+do
+   read -p "Your name: " name
+   email="${name}@easytocloud.com"
+   echo "Using name=$name email=${email}"
+   git config --global user.email "${name}"
+   git config --global user.name  "${email}"
+done
+git config --global core.editor vi
+
+# git pull
+
+git add .; git commit; git push
+# git add .; git commit; git push; git push --tags

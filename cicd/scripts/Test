@@ -1,0 +1,22 @@
+#!/bin/sh
+
+if [ ! -d "Scenarios" ]
+then
+    echo "Error: cannot find 'Scenarios' directory in ${PWD}" >&2
+    exit 1
+fi
+
+tests=""
+for test in $*
+do
+    tests="${tests} "$(ls Scenarios/${test}*)
+    # for found in ${tests}
+    # do  
+    #     ./TestScenarios.js ${found}
+    # done
+done
+if [ "${tests}" == "" ]
+then
+   exit 1
+fi
+./TestScenarios.js ${tests}

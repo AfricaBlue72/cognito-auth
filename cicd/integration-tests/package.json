@@ -1,0 +1,21 @@
+{
+  "name": "integration-tests",
+  "version": "1.0.0",
+  "description": "The following tests need to be created",
+  "main": "API.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "async": "^2.6.3",
+    "aws-sdk": "^2.658.0",
+    "js2xmlparser": "^4.0.1",
+    "jsonlint-mod": "^1.7.6",
+    "package.json": "^2.0.1",
+    "request": "2.88.0",
+    "sprintf-js": "^1.1.2",
+    "xml2js": "^0.4.23"
+  }
+}

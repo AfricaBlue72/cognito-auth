@@ -1,0 +1,3 @@
+#!/bin/sh
+aws cloudformation list-exports --query 'Exports[].[Name,Value]' --output text
+

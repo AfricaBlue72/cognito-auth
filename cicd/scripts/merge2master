@@ -1,0 +1,30 @@
+#!/bin/sh
+
+
+Merge2Master()
+{
+   echo "Merging to master..."
+   
+   git status
+
+   git checkout development
+   git push
+   git checkout master
+   git merge development
+   git push
+   git checkout development
+   git pull
+}
+
+while [ "$PWD" != "/" ]
+do
+   if [ -d ".git" ]
+   then
+      echo "Found root at ${PWD}"
+      Merge2Master
+      exit 0
+   fi
+   cd ..
+done
+echo "No git root found?"
+exit -1

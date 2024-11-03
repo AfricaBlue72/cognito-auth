@@ -1,0 +1,8 @@
+#!/bin/sh
+
+for tag in $*
+do
+   echo "About to delete tag '$tag'..."
+   git tag -d "${tag}"
+   git push --delete origin "${tag}"
+done

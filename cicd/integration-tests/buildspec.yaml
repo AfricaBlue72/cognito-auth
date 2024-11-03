@@ -1,0 +1,36 @@
+# used by: CodeBuild
+version: 0.2
+
+env:
+  variables:
+    WHATEVER: "whatever"
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 12
+      python: 3.8
+    commands:
+      - echo Changing shell scripts to 755...
+      - find . -name '*.sh' -exec chmod 755 {} ';'
+      - echo Modifying all nodejs and python scripts to mode 755...
+      - find cicd -name '*.js' -exec chmod 755 {} ';'
+      - find cicd -name '*.py' -exec chmod 755 {} ';'
+      - echo yum install banner -y
+  build:
+    commands:
+      - echo Running Integration Tests...
+      - echo Changing role first...
+      - . ./cicd/scripts/changerole.sh
+      - cd ${CODEBUILD_SRC_DIR}/cicd/integration-tests
+      - ./test.sh
+  post_build:
+    commands:
+      - cd ${CODEBUILD_SRC_DIR}
+      - echo Finished
+
+artifacts:
+  files:
+    - cicd/integration-tests/output
+  discard-paths: no
+

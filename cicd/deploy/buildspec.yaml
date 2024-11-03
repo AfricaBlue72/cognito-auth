@@ -1,0 +1,56 @@
+# used by: CodeBuild in Deploy phase
+
+version: 0.2
+
+env:
+  variables:
+    WHATEVER: "whatever"
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 20
+      python: 3.10
+
+    commands:
+      - echo Check wihch package manager is used
+      - which dnf yum apt || true
+      - ls -las
+      - echo Modifying cfdeploy to mode 755...
+      - chmod u+x backend/cicd/scripts/cfdeploy
+      - ls -l backend/cicd/scripts/cfdeploy
+      - echo Changing shell scripts to 755...
+      - find . -name '*.sh' -exec chmod 755 {} ';'
+      - find backend/cicd -name '*.js' -exec chmod 755 {} ';'
+      - find backend/cicd -name '*.py' -exec chmod 755 {} ';'
+      - chmod 755 backend/cicd/scripts/*
+      - echo Adding backend/cicd/scripts to PATH...
+      - export PATH=$(pwd)/backend/cicd/scripts:$PATH
+      - echo Now install other tools - echo "Checking if pip is installed..."
+      - pip3 --version || sudo dnf install python3-pip
+      - echo Instal botocore and boto3
+      - pip install botocore
+      - pip install boto3
+
+  build:
+    commands:
+      - echo Changing role...
+      - . ./backend/cicd/scripts/changerole.sh
+      - aws sts get-caller-identity
+      - echo Deploying...
+      - cd backend/product
+      - ls -las
+      - make deploy
+      # - ./deploy.sh
+
+
+  post_build:
+    commands:
+      - cd ${CODEBUILD_SRC_DIR}
+      - echo All zip files
+      - find . -name '*.zip' -o -name '*.ZIP'
+
+artifacts:
+  files:
+    - '**/*'
+  discard-paths: no

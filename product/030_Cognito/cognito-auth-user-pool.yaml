@@ -1,0 +1,494 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS CloudFormation template to launch resources for a cognito identity pool
+
+Parameters:
+  ProductName: 
+    Type: String
+    Default: cognito-auth
+    
+  UserPoolName:
+    Description: The name of the userpool
+    Type: String
+    Default: cognito-auth-user-pool
+    # AllowedPattern: [\w\s+=,.@-]+
+    MinLength: 1
+    MaxLength: 128
+    
+  EmailMessage:
+    Description: Email message on a admin invite 
+    Default: '{username}; You are invited; please accept with code {####}'
+    Type: String 
+    # AllowedPattern: [\p{L}\p{M}\p{S}\p{N}\p{P}\s*]*\{####\}[\p{L}\p{M}\p{S}\p{N}\p{P}\s*]*
+    MinLength: 6
+    MaxLength: 4096
+    
+  EmailSubject:
+    Description: Subject of the email invite
+    Default: You are invited
+    Type: String
+    # AllowedPattern:  [\p{L}\p{M}\p{S}\p{N}\p{P}\s]+
+    MinLength: 1
+    MaxLength: 140
+    
+  SMSMessage:
+    Description: SMS message for an invite
+    Default: '{username}; You are invited; please accept with code {####}.'
+    Type: String
+    AllowedPattern: '.*\{####\}.*'
+    MinLength: 6
+    MaxLength: 140
+    
+  EmailVerificationMessage:
+    Description: Verification email after sign up
+    Default: '{username}; Please verify your signup with code {####}.'
+    Type: String 
+    # AllowedPattern: [\p{L}\p{M}\p{S}\p{N}\p{P}\s*]*\{####\}[\p{L}\p{M}\p{S}\p{N}\p{P}\s*]*
+    MinLength: 6
+    MaxLength: 4096
+    
+  EmailVerificationSubject:
+    Description: Subject of the email verifying sign up
+    Default: Signup verification
+    Type: String
+    # AllowedPattern:  [\p{L}\p{M}\p{S}\p{N}\p{P}\s]+
+    MinLength: 1
+    MaxLength: 140
+    
+  SmsVerificationMessage:
+    Description: SMS verification message
+    Default: ' {username}; Please verify with {####}.'
+    Type: String
+    AllowedPattern: '.*\{####\}.*'
+    MinLength: 6
+    MaxLength: 140
+    
+  NewUserTopicName:
+    Description: Topic to receive new, verified users
+    Default: new-user-topic
+    Type: String
+
+  Environment:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /Environment
+
+  GoogleClientId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /Auth/GoogleClientId
+
+  GoogleClientSecret:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /Auth/GoogleClientSecret
+
+Resources:
+################################################################################
+## New users topic
+################################################################################
+  NewUserTopic:
+    Type: AWS::SNS::Topic
+    Properties: 
+      DisplayName: !Sub ${ProductName}-${NewUserTopicName}
+      TopicName: !Sub ${ProductName}-${NewUserTopicName}
+
+      
+################################################################################
+## Post confirmation lambda trigger.
+################################################################################
+  PostConfirmationRole: 
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        -   Effect: Allow
+            Principal:
+              Service:
+              -   lambda.amazonaws.com
+            Action:
+            -   sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+      -   arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+      -   PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+            -   Effect: Allow
+                Action:
+                -   sns:publish
+                Resource: '*'             
+
+  PostConfirmationFunction:  
+    Type: AWS::Lambda::Function
+    DependsOn: PostConfirmationRole
+    Properties:  
+      FunctionName: cognito-trigger-post-confirmation
+      Description: write confirmed users to queue
+      Role:  !GetAtt PostConfirmationRole.Arn 
+      Handler: index.handler
+      Environment: 
+        Variables:
+          topic: !Ref NewUserTopic
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          def handler(event, context):
+              if event.get('userName') is not None and event.get('request') is not None and event['request'].get('userAttributes') is not None:
+                  print(f"Event: {json.dumps(event)}")
+                  try:
+                      sns = boto3.client('sns')
+                      msg = {
+                          'userName': event['userName'],
+                          'userAttributes': event['request']['userAttributes']
+                      }
+                      
+                      params = {
+                          'Subject': "NewUser",
+                          'TopicArn': os.environ['topic'],
+                          'Message': json.dumps(msg)
+                      }
+
+                      data = sns.publish(**params)
+                      resp = {
+                          'result': "SUCCESS",
+                          'data': data
+                      }
+                      print(json.dumps(resp))
+                      return event
+                  except Exception as err:
+                      exc = {
+                          'result': "EXCEPTION",
+                          'error': str(err)
+                      }
+                      print(json.dumps(exc))
+                      raise Exception("An error occurred writing to SNS")
+              else:
+                  err = {
+                      'result': "ERROR",
+                      'evt': event
+                  }
+                  print(json.dumps(err))
+                  raise Exception("Invalid event")
+      Runtime: python3.12
+      MemorySize: 128 
+      Timeout: 30
+    
+################################################################################
+## Custom message
+################################################################################
+  CustomMessageRole: 
+    Type: AWS::IAM::Role
+    Properties: 
+      RoleName: AccessToLanguageFilesRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        -   Effect: Allow
+            Principal:
+              Service:
+              -   lambda.amazonaws.com
+            Action:
+            -   sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+      -   arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      -   arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+
+  CustomMessageFunction:  
+    Type: AWS::Lambda::Function
+    DependsOn: CustomMessageRole
+    Properties:  
+      FunctionName: cognito-trigger-custom-message
+      Description: customize Cognito messages.
+      Role:  !GetAtt CustomMessageRole.Arn 
+      Handler: index.handler
+      Environment: 
+        Variables: 
+          bucket: !ImportValue CustomMessageTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          def get_object(src, lang, type):
+              try:
+                  s3 = boto3.client('s3')
+                  params = {
+                      'Bucket': os.environ['bucket'],
+                      'Key': f"locale/{lang}/{src}/{type}"
+                  }
+                  data = s3.get_object(**params)
+                  return data['Body'].read().decode('utf-8')
+              except Exception as err:
+                  exc = {
+                      'result': "EXCEPTION",
+                      'error': str(err)
+                  }
+                  print(json.dumps(exc))
+                  return None
+
+          def handler(event, context):
+              log_evt = event.copy()
+              log_evt['request']['userAttributes']['email'] = "*"
+              print(f"Event received: {json.dumps(log_evt)}")
+              
+              src = event['triggerSource']
+              lang = event['request']['userAttributes']['locale']
+              
+              sms = get_object(src, lang, "smsMessage") or "Activation code is _####_"
+              sub = get_object(src, lang, "emailSubject") or "Activation code"
+              mail = get_object(src, lang, "emailMessage") or "Activation code is _####_"
+              
+              sms = sms.replace("_####_", event['request']['codeParameter'])
+              mail = mail.replace("_####_", event['request']['codeParameter'])
+              
+              if src == "CustomMessage_AdminCreateUser":
+                  sms = sms.replace("_%%%%_", event['request']['usernameParameter'])
+                  mail = mail.replace("_%%%%_", event['request']['usernameParameter'])
+              
+              event['response']['smsMessage'] = sms
+              event['response']['emailSubject'] = sub
+              event['response']['emailMessage'] = mail
+              
+              log_evt = event.copy()
+              log_evt['request']['userAttributes']['email'] = "*"
+              print(f"Event sent: {json.dumps(log_evt)}")
+              
+              return event
+      Runtime: python3.12
+      MemorySize: 128 
+      Timeout: 30
+    
+    
+################################################################################
+## User pool
+################################################################################
+  UserPoolSMSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProductName}-user-pool-sms-role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        -   Effect: Allow
+            Principal:
+              Service:
+              -   cognito-idp.amazonaws.com
+            Action:
+            -   sts:AssumeRole
+      Path: "/"
+      Policies: 
+      -   PolicyName: root
+          PolicyDocument: 
+            Version: 2012-10-17
+            Statement: 
+            - 
+              Effect: Allow
+              Action: 
+              -   SNS:Publish
+              -   SNS:SendSMSMessage
+              Resource: "*"
+            
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    DependsOn: 
+    -   UserPoolSMSRole
+    -   NewUserTopic
+    Properties: 
+      AccountRecoverySetting: 
+        RecoveryMechanisms:
+        -   Name: verified_email
+            Priority: 1
+        -   Name: verified_phone_number
+            Priority: 2
+      AdminCreateUserConfig: 
+        AllowAdminCreateUserOnly: False
+        InviteMessageTemplate: 
+          EmailMessage: !Ref EmailMessage
+          EmailSubject: !Ref EmailSubject
+          SMSMessage: !Ref SMSMessage
+        # UnusedAccountValidityDays: 1
+      # AliasAttributes: 
+      # - email
+      # - preferred_username
+      AutoVerifiedAttributes: 
+      -   phone_number
+      -   email
+      # DeviceConfiguration: 
+      #     ChallengeRequiredOnNewDevice: True
+      #     DeviceOnlyRememberedOnUserPrompt: False
+      #  EmailConfiguration: 
+      #     ConfigurationSet: String
+      #     EmailSendingAccount: String
+      #     From: String
+      #     ReplyToEmailAddress: String
+      #     SourceArn: String
+      EmailVerificationMessage: !Ref EmailVerificationMessage
+      EmailVerificationSubject: !Ref EmailVerificationSubject
+      EnabledMfas: 
+      -   SMS_MFA
+      LambdaConfig: 
+      #     CreateAuthChallenge: Arn
+        CustomMessage: !GetAtt CustomMessageFunction.Arn
+      #     DefineAuthChallenge: Arn
+      #     PostAuthentication: Arn
+        PostConfirmation: !GetAtt PostConfirmationFunction.Arn
+      #     PreAuthentication: Arn
+      #     PreSignUp: Arn
+      #     PreTokenGeneration: Arn
+      #     UserMigration: Arn
+      #     VerifyAuthChallengeResponse: Arn
+      MfaConfiguration: OPTIONAL
+      Policies: 
+        PasswordPolicy: 
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireUppercase: false
+          RequireSymbols: false
+          RequireNumbers: false
+          TemporaryPasswordValidityDays: 1
+      Schema: 
+      -   Name: email
+          StringAttributeConstraints: 
+            MinLength: 0
+            MaxLength: 2048
+          DeveloperOnlyAttribute: false
+          Required: true
+          AttributeDataType: String
+          Mutable: true
+      -   Name: preferred_username
+          StringAttributeConstraints: 
+            MinLength: 0
+            MaxLength: 2048
+          DeveloperOnlyAttribute: false
+          Required: false
+          AttributeDataType: String
+          Mutable: true
+      -   Name: name
+          StringAttributeConstraints: 
+            MinLength: 0
+            MaxLength: 2048
+          DeveloperOnlyAttribute: false
+          Required: false
+          AttributeDataType: String
+          Mutable: true
+      -   Name: birthdate
+          StringAttributeConstraints: 
+            MinLength: 0
+            MaxLength: 10
+          DeveloperOnlyAttribute: false
+          Required: false
+          AttributeDataType: String
+          Mutable: true
+      -   Name: locale
+          StringAttributeConstraints: 
+            MinLength: 0
+            MaxLength: 10
+          DeveloperOnlyAttribute: false
+          Required: true
+          AttributeDataType: String
+          Mutable: true
+      -   Name: zoneinfo
+          StringAttributeConstraints: 
+            MinLength: 0
+            MaxLength: 2048
+          DeveloperOnlyAttribute: false
+          Required: false
+          AttributeDataType: String
+          Mutable: true
+      -   Name: data
+          AttributeDataType: String
+          StringAttributeConstraints: 
+            MinLength: 1
+            MaxLength: 2048
+          DeveloperOnlyAttribute: false
+          Mutable: true
+      -   Name: group
+          AttributeDataType: String
+          StringAttributeConstraints: 
+            MinLength: 1
+            MaxLength: 2048
+          DeveloperOnlyAttribute: false
+      -   Name: billing
+          AttributeDataType: String
+          StringAttributeConstraints: 
+            MinLength: 1
+            MaxLength: 2048
+          DeveloperOnlyAttribute: false
+          Mutable: true
+      SmsConfiguration: 
+        ExternalId: !Ref AWS::AccountId
+        SnsCallerArn: !GetAtt UserPoolSMSRole.Arn
+      SmsVerificationMessage: !Ref SmsVerificationMessage
+      UsernameAttributes: 
+      -   email
+      -   phone_number
+      UserPoolName: !Ref UserPoolName
+      UserPoolTags: {}
+
+  CallCustomMessageFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties: 
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CustomMessageFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt CognitoUserPool.Arn   
+            
+  CallPostConfirmationFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties: 
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PostConfirmationFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt CognitoUserPool.Arn  
+
+  GoogleIdentityProvider:
+    Type: AWS::Cognito::UserPoolIdentityProvider
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      ProviderName: Google
+      ProviderType: Google
+      ProviderDetails: 
+        client_id: !Ref GoogleClientId
+        client_secret: !Ref GoogleClientSecret
+        authorize_scopes: "profile email openid"
+      AttributeMapping:
+        email: email
+        email_verified: email_verified
+        username: sub
+        name: name
+        locale: locale
+        birthdate: birthdate
+        zoneinfo: zoneinfo
+        preferred_username: preferred_username
+
+  CognitoUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub auth-${Environment}-domain-${AWS::Region}-${AWS::AccountId}
+      UserPoolId: !Ref CognitoUserPool
+
+Outputs:
+    UserPoolIdOutput:
+        Value: !Ref CognitoUserPool 
+        Export:  
+            Name: !Sub ${UserPoolName}-id
+      
+    UserPoolArnOutput:
+        Value: !GetAtt CognitoUserPool.Arn
+        Export:  
+            Name: !Sub ${UserPoolName}-arn
+
+    UserPoolProviderName:
+      Value: !GetAtt CognitoUserPool.ProviderName
+      Export:
+        Name: !Sub ${UserPoolName}-provider-name
+    
+    NewUserTopicArnOutput:
+        Value: !Ref NewUserTopic
+        Export:
+            Name: !Sub ${ProductName}-${NewUserTopicName}

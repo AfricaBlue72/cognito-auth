@@ -1,0 +1,22 @@
+[
+
+   {
+      "Name": "Verify we got an Environment",
+      "Enabled": true,
+      "Action": "IsNotEmpty",
+      "Data": [
+         "${Environment}"
+      ],
+      "Comment": "Environment is a Cloudformation Export value",
+      "Errors": 0
+   },
+   {
+      "Name": "Verify we miss a nonsense variable",
+      "Enabled": true,
+      "Action": "IsEmpty",
+      "Data": [
+         "${NonsenseVariable}"
+      ],
+      "Errors": 0
+   }
+]
