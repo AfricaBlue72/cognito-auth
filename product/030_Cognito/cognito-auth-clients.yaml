@@ -55,6 +55,35 @@ Resources:
         - profile
         - aws.cognito.signin.user.admin
       AllowedOAuthFlowsUserPoolClient: true
+      # ReadAttributes:
+      #   - email
+      #   - preferred_username
+      #   - name
+      #   - birthdate
+      #   - locale
+      #   - zoneinfo
+      #   - given_name
+      #   - family_name
+      #   - picture
+      #   - phone_number
+      #   - custom:theme
+      #   - custom:data
+      #   - custom:group
+      #   - custom:billing
+      #   - email_verified
+      #   - phone_number_verified
+      # WriteAttributes:
+      #   - email
+      #   - preferred_username
+      #   - name
+      #   - birthdate
+      #   - locale
+      #   - zoneinfo
+      #   - given_name
+      #   - family_name
+      #   - picture
+      #   - phone_number
+      #   - theme
 
   IdentityPool:            
     Type: AWS::Cognito::IdentityPool

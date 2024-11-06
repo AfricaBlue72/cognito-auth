@@ -352,7 +352,7 @@ Resources:
           RequireNumbers: false
           TemporaryPasswordValidityDays: 1
       Schema: 
-      -   Name: email
+        - Name: email
           StringAttributeConstraints: 
             MinLength: 0
             MaxLength: 2048
@@ -360,7 +360,7 @@ Resources:
           Required: true
           AttributeDataType: String
           Mutable: true
-      -   Name: preferred_username
+        - Name: preferred_username
           StringAttributeConstraints: 
             MinLength: 0
             MaxLength: 2048
@@ -368,7 +368,7 @@ Resources:
           Required: false
           AttributeDataType: String
           Mutable: true
-      -   Name: name
+        - Name: name
           StringAttributeConstraints: 
             MinLength: 0
             MaxLength: 2048
@@ -376,7 +376,7 @@ Resources:
           Required: false
           AttributeDataType: String
           Mutable: true
-      -   Name: birthdate
+        - Name: birthdate
           StringAttributeConstraints: 
             MinLength: 0
             MaxLength: 10
@@ -384,7 +384,7 @@ Resources:
           Required: false
           AttributeDataType: String
           Mutable: true
-      -   Name: locale
+        - Name: locale
           StringAttributeConstraints: 
             MinLength: 0
             MaxLength: 10
@@ -392,7 +392,7 @@ Resources:
           Required: true
           AttributeDataType: String
           Mutable: true
-      -   Name: zoneinfo
+        - Name: zoneinfo
           StringAttributeConstraints: 
             MinLength: 0
             MaxLength: 2048
@@ -400,25 +400,124 @@ Resources:
           Required: false
           AttributeDataType: String
           Mutable: true
-      -   Name: data
-          AttributeDataType: String
+        - Name: given_name
           StringAttributeConstraints: 
-            MinLength: 1
+            MinLength: 0
             MaxLength: 2048
           DeveloperOnlyAttribute: false
+          Required: false
+          AttributeDataType: String
           Mutable: true
-      -   Name: group
+        - Name: family_name
+          StringAttributeConstraints: 
+            MinLength: 0
+            MaxLength: 2048
+          DeveloperOnlyAttribute: false
+          Required: false
+          AttributeDataType: String
+          Mutable: true
+        - Name: picture
+          StringAttributeConstraints: 
+            MinLength: 0
+            MaxLength: 2048
+          DeveloperOnlyAttribute: false
+          Required: false
+          AttributeDataType: String
+          Mutable: true
+        - Name: phone_number
+          StringAttributeConstraints: 
+            MinLength: 0
+            MaxLength: 2048
+          DeveloperOnlyAttribute: false
+          Required: false
+          AttributeDataType: String
+          Mutable: true
+        - Name: theme
+          StringAttributeConstraints: 
+            MinLength: 0
+            MaxLength: 2048
+          DeveloperOnlyAttribute: false
+          Required: false
+          AttributeDataType: String
+          Mutable: true
+        - Name: data
           AttributeDataType: String
           StringAttributeConstraints: 
             MinLength: 1
             MaxLength: 2048
           DeveloperOnlyAttribute: false
-      -   Name: billing
+          Required: false
+          Mutable: false
+        - Name: group
           AttributeDataType: String
           StringAttributeConstraints: 
             MinLength: 1
             MaxLength: 2048
           DeveloperOnlyAttribute: false
+          Required: false
+        - Name: billing
+          AttributeDataType: String
+          StringAttributeConstraints: 
+            MinLength: 1
+            MaxLength: 2048
+          DeveloperOnlyAttribute: false
+          Required: false
+          Mutable: false
+        - Name: middle_name
+          StringAttributeConstraints: 
+            MinLength: 0
+            MaxLength: 2048
+          DeveloperOnlyAttribute: false
+          Required: false
+          AttributeDataType: String
+          Mutable: true
+        - Name: nickname
+          StringAttributeConstraints: 
+            MinLength: 0
+            MaxLength: 2048
+          DeveloperOnlyAttribute: false
+          Required: false
+          AttributeDataType: String
+          Mutable: true
+        - Name: gender
+          StringAttributeConstraints: 
+            MinLength: 0
+            MaxLength: 2048
+          DeveloperOnlyAttribute: false
+          Required: false
+          AttributeDataType: String
+          Mutable: true
+        - Name: profile
+          StringAttributeConstraints: 
+            MinLength: 0
+            MaxLength: 2048
+          DeveloperOnlyAttribute: false
+          Required: false
+          AttributeDataType: String
+          Mutable: true
+        - Name: website
+          StringAttributeConstraints: 
+            MinLength: 0
+            MaxLength: 2048
+          DeveloperOnlyAttribute: false
+          Required: false
+          AttributeDataType: String
+          Mutable: true
+        - Name: address
+          StringAttributeConstraints: 
+            MinLength: 0
+            MaxLength: 2048
+          DeveloperOnlyAttribute: false
+          Required: false
+          AttributeDataType: String
+          Mutable: true
+        - Name: updated_at
+          NumberAttributeConstraints:
+            MinValue: 0
+            MaxValue: 9999999999
+          DeveloperOnlyAttribute: false
+          Required: false
+          AttributeDataType: Number
           Mutable: true
       SmsConfiguration: 
         ExternalId: !Ref AWS::AccountId
