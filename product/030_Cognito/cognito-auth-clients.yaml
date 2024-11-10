@@ -41,11 +41,17 @@ Resources:
       CallbackURLs: !If 
         - IsProduction
         - - https://cognito-app.bluecoast.co.za
+          - !Sub https://${Environment}-cognito-app.bluecoast.co.za
+          - http://localhost:3000
         - - !Sub https://${Environment}-cognito-app.bluecoast.co.za
+          - http://localhost:3000
       LogoutURLs: !If 
         - IsProduction
         - - https://cognito-app.bluecoast.co.za
+          - !Sub https://${Environment}-cognito-app.bluecoast.co.za
+          - http://localhost:3000
         - - !Sub https://${Environment}-cognito-app.bluecoast.co.za
+          - http://localhost:3000
       AllowedOAuthFlows:
         - code
         - implicit

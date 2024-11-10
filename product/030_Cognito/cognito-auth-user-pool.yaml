@@ -389,7 +389,7 @@ Resources:
             MinLength: 0
             MaxLength: 10
           DeveloperOnlyAttribute: false
-          Required: true
+          Required: false
           AttributeDataType: String
           Mutable: true
         - Name: zoneinfo
